@@ -1,0 +1,85 @@
+{
+  "total_frames": 62,
+  "frame_width": 3840,
+  "frame_height": 2160,
+  "fps": 12.0,
+  "num_points": 8,
+  "points_by_frame": {
+    "0": [
+      [
+        1507,
+        724
+      ],
+      [
+        1363,
+        638
+      ],
+      [
+        1190,
+        475
+      ],
+      [
+        1276,
+        187
+      ],
+      [
+        1545,
+        168
+      ],
+      [
+        1660,
+        259
+      ],
+      [
+        1684,
+        393
+      ],
+      [
+        1579,
+        825
+      ]
+    ]
+  },
+  "video_path": "teaser3/weight_on_pillow.mp4",
+  "instruction": "segment the weight",
+  "primary_points_by_frame": {
+    "0": [
+      [
+        1507,
+        724
+      ],
+      [
+        1363,
+        638
+      ],
+      [
+        1190,
+        475
+      ],
+      [
+        1276,
+        187
+      ],
+      [
+        1545,
+        168
+      ],
+      [
+        1660,
+        259
+      ],
+      [
+        1684,
+        393
+      ],
+      [
+        1579,
+        825
+      ]
+    ]
+  },
+  "primary_frames": [
+    0
+  ],
+  "first_appears_frame": 0
+}
