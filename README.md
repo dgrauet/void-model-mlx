@@ -320,7 +320,7 @@ Due to licensing constraints on the underlying datasets, we release the **data g
 
 #### Source 1: HuMoTo (Human-Object Interaction)
 
-Generates counterfactual videos from the [HuMoTo](https://4d-humans.github.io/) motion capture dataset using Blender. A human (Remy/Sophie character) interacts with objects; removing the human causes objects to fall via physics simulation.
+Generates counterfactual videos from the [HUMOTO]([https://4d-humans.github.io/](https://github.com/adobe-research/humoto)) motion capture dataset using Blender. A human (Remy/Sophie character) interacts with objects; removing the human causes objects to fall via physics simulation.
 
 **Prerequisites:**
 1. Request access to the HuMoTo dataset from the authors at [adobe-research/humoto](https://github.com/adobe-research/humoto) and download it once approved
