@@ -8,7 +8,7 @@
   <a href="https://void-model.github.io/" target="_blank" style="margin: 2px;">
     <img alt="Website" src="https://img.shields.io/badge/Website-VOID-4285F4" style="display: inline-block; vertical-align: middle;"/>
   </a>
-  <a href="https://arxiv.org/abs/XXXX.XXXXX" target="_blank" style="margin: 2px;">
+  <a href="https://arxiv.org/abs/2604.02296" target="_blank" style="margin: 2px;">
     <img alt="arXiv" src="https://img.shields.io/badge/arXiv-VOID-FBBC06" style="display: inline-block; vertical-align: middle;"/>
   </a>
       <a href="https://huggingface.co/spaces/sam-motamed/VOID" target="_blank" style="margin: 2px;">
