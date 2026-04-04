@@ -490,7 +490,17 @@ If you’ve built something using VOID, feel free to submit a PR to add it here.
 This implementation builds on code and models from [aigc-apps/VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun/tree/main), [Gen-Omnimatte](https://github.com/gen-omnimatte/gen-omnimatte-public/tree/main), [Go-with-the-Flow](https://github.com/Eyeline-Labs/Go-with-the-Flow), [Kubric](https://github.com/google-research/kubric) and [HUMOTO](https://jiaxin-lu.github.io/humoto/). We thank the authors for sharing the codes and pretrained inpainting models for CogVideoX, Gen-Omnimatte, and the optical flow warping utilities.
 
 ---
+## Star History
 
+<a href="https://www.star-history.com/?repos=netflix%2Fvoid-model&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=netflix/void-model&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=netflix/void-model&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=netflix/void-model&type=date&legend=top-left" />
+ </picture>
+</a>
+
+---
 ## 📄 Citation
 
 If you find our work useful, please consider citing:
