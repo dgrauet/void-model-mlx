@@ -184,13 +184,11 @@ class VOIDPipeline:
             (video_shape, video_cf, inpaint_cf)
         """
         F = video.shape[0]
-        # Normalize video to [-1, 1] (VAE expects this range)
+        # Normalize video to [-1, 1] (VAE trained on this range)
         video_mx = mx.array(video[None]) * 2 - 1  # [0,1] -> [-1,1]
         mask_1ch = mx.array(mask[None])
-        # Mask is inverted and tiled to 3ch — keep in [0,1] (semantic values, not pixels)
+        # Mask stays in [0, 1] — semantic values, not pixel intensities
         inverted_mask_3ch = mx.repeat(1.0 - mask_1ch, 3, axis=-1)
-        # Normalize mask to [-1, 1] for VAE too (original pipeline passes it through VAE)
-        inverted_mask_3ch = inverted_mask_3ch * 2 - 1
 
         mask_latents = []
         video_latents = []
