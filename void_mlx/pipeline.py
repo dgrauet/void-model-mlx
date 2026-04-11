@@ -357,6 +357,88 @@ class VOIDPipeline:
 
         return np.array(output[0].astype(mx.float32))
 
+    def run_pass2(
+        self,
+        video: np.ndarray,
+        mask: np.ndarray,
+        prompt: str,
+        pass1_output: np.ndarray,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 1.0,
+        seed: int = 42,
+    ) -> np.ndarray:
+        """Run VOID pass 2 (refinement with warped noise).
+
+        Uses optical flow from pass 1 output to create temporally
+        coherent noise, then denoises with pass 2 weights.
+
+        Args:
+            video: (F, H, W, 3) original input video.
+            mask: (F, H, W, 1) quadmask.
+            prompt: Text prompt.
+            pass1_output: (F_out, H, W, 3) output from pass 1.
+
+        Returns:
+            (F_out, H, W, 3) refined output in [0, 1].
+        """
+        if self.pass2_checkpoint is None:
+            raise ValueError("pass2_checkpoint required for pass 2")
+
+        from void_mlx.warped_noise import generate_warped_noise
+
+        pipe = self._make_pipeline()
+
+        # Encode inputs (same as pass 1)
+        video_shape, video_cf, inpaint_cf = self._encode_inputs(video, mask)
+        B, F_vid, H_vid, W_vid, _ = video_shape
+        F_lat = video_cf.shape[1]
+        _, _, C_lat, H_lat, W_lat = video_cf.shape
+
+        # Generate warped noise from pass 1 output
+        print("  Generating warped noise from pass 1...")
+        warped = generate_warped_noise(
+            pass1_output, F_lat, H_lat, W_lat,
+            latent_channels=C_lat, seed=seed,
+        )
+        # (F_lat, H_lat, W_lat, C_lat) -> (1, F_lat, C_lat, H_lat, W_lat)
+        warped_cf = mx.array(warped[None]).transpose(0, 1, 4, 2, 3)
+
+        # Load pass 2 weights
+        print("  Loading VOID pass2 weights...")
+        load_void_weights(self.transformer, self.pass2_checkpoint)
+
+        # Prompt
+        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False)
+        mx.eval(prompt_embeds)
+
+        # Use warped noise as starting point (replaces random noise)
+        pipe.scheduler.set_timesteps(num_inference_steps)
+        current = warped_cf  # start from warped noise directly
+
+        # RoPE
+        image_rotary_emb = pipe._prepare_rotary_embeddings(H_vid, W_vid, F_lat)
+
+        # Denoise
+        t0 = time.monotonic()
+        current = self._denoise_window(
+            current, inpaint_cf, prompt_embeds, image_rotary_emb,
+            pipe.scheduler, pipe.scheduler.timesteps,
+        )
+
+        # Decode
+        decoded = current.transpose(0, 1, 3, 4, 2) / self.vae.scaling_factor
+        output = self.vae.decode(decoded)
+        output = mx.clip(output / 2 + 0.5, 0, 1)
+        mx.eval(output)
+
+        elapsed = time.monotonic() - t0
+        print(f"  Pass 2: {elapsed:.1f}s ({elapsed/num_inference_steps:.1f}s/step)")
+
+        # Reload pass 1 weights for next run
+        load_void_weights(self.transformer, self.pass1_checkpoint)
+
+        return np.array(output[0].astype(mx.float32))
+
     def __call__(
         self,
         video: np.ndarray,
@@ -367,18 +449,20 @@ class VOIDPipeline:
         seed: int = 42,
         temporal_window: int = 85,
         temporal_stride: int = 16,
+        two_pass: bool = False,
     ) -> np.ndarray:
-        """Run full VOID inference (pass 1 only for now).
+        """Run VOID inference.
 
         Args:
             video: (F, H, W, 3) float32 in [0, 1].
             mask: (F, H, W, 1) float32 quadmask.
             prompt: Text prompt.
+            two_pass: If True and pass2_checkpoint is set, run both passes.
 
         Returns:
             (F_out, H, W, 3) float32 output in [0, 1].
         """
-        return self.run_pass1(
+        output = self.run_pass1(
             video, mask, prompt,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
@@ -386,3 +470,13 @@ class VOIDPipeline:
             temporal_window=temporal_window,
             temporal_stride=temporal_stride,
         )
+
+        if two_pass and self.pass2_checkpoint is not None:
+            output = self.run_pass2(
+                video, mask, prompt, output,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+            )
+
+        return output

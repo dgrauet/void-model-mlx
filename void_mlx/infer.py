@@ -55,7 +55,9 @@ def main():
     )
 
     # Run inference
-    print(f"\nRunning VOID inference ({args.steps} steps, guidance={args.guidance_scale})...")
+    two_pass = args.pass2 is not None
+    mode = "two-pass" if two_pass else "pass 1 only"
+    print(f"\nRunning VOID inference ({mode}, {args.steps} steps)...")
     output = pipe(
         video=video,
         mask=mask,
@@ -63,6 +65,7 @@ def main():
         num_inference_steps=args.steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
+        two_pass=two_pass,
     )
 
     # Save output
