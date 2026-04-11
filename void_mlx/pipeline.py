@@ -127,6 +127,59 @@ class VOIDPipeline:
             tokenizer=self.tokenizer,
         )
 
+    def _encode_inputs(self, video: np.ndarray, mask: np.ndarray, batch_frames: int = 9):
+        """Encode video and mask to latent space for VOID conditioning.
+
+        Encodes in batches of frames to avoid OOM on long videos.
+
+        Returns:
+            (video_shape, video_cf, inpaint_cf)
+        """
+        F = video.shape[0]
+        video_mx = mx.array(video[None])
+        mask_1ch = mx.array(mask[None])
+        inverted_mask_3ch = mx.repeat(1.0 - mask_1ch, 3, axis=-1)
+
+        # Encode in temporal batches to save memory
+        # VAE temporal compression = 4x, so batch_frames should be 4k+1
+        mask_latents = []
+        video_latents = []
+        for start in range(0, F, batch_frames):
+            end = min(start + batch_frames, F)
+            m_batch = self.vae.encode(inverted_mask_3ch[:, start:end]).mode() * self.vae.scaling_factor
+            v_batch = self.vae.encode(video_mx[:, start:end]).mode() * self.vae.scaling_factor
+            mx.eval(m_batch, v_batch)
+            mask_latents.append(m_batch)
+            video_latents.append(v_batch)
+
+        mask_encoded = mx.concatenate(mask_latents, axis=1)
+        video_encoded = mx.concatenate(video_latents, axis=1)
+
+        mask_cf = mask_encoded.transpose(0, 1, 4, 2, 3)
+        video_cf = video_encoded.transpose(0, 1, 4, 2, 3)
+        inpaint_cf = mx.concatenate([mask_cf, video_cf], axis=2)
+
+        mx.eval(video_cf, inpaint_cf)
+        return video_mx.shape, video_cf, inpaint_cf
+
+    def _denoise_window(
+        self, latents, inpaint, prompt_embeds, rope, scheduler, timesteps,
+    ):
+        """Run denoising on a single temporal window."""
+        current = latents
+        for t in timesteps:
+            t_input = mx.array([float(t)])
+            noise_pred = self.transformer(
+                hidden_states=current,
+                encoder_hidden_states=prompt_embeds,
+                timestep=t_input,
+                inpaint_latents=inpaint,
+                image_rotary_emb=rope,
+            )
+            current = scheduler.step(noise_pred, t, current)
+            mx.eval(current)
+        return current
+
     def run_pass1(
         self,
         video: np.ndarray,
@@ -135,79 +188,115 @@ class VOIDPipeline:
         num_inference_steps: int = 50,
         guidance_scale: float = 1.0,
         seed: int = 42,
+        temporal_window: int = 85,
+        temporal_stride: int = 16,
     ) -> np.ndarray:
-        """Run VOID pass 1 (base inpainting with quadmask).
-
-        VOID uses VAE-encoded mask (16ch) instead of raw 1ch mask.
-        The mask is inverted (1-mask), tiled to 3ch RGB, and encoded by VAE.
-        The masked_video is the original video (not zeroed out).
-        guidance_scale defaults to 1.0 (VOID doesn't use CFG).
+        """Run VOID pass 1 with temporal multidiffusion for long videos.
 
         Args:
             video: (F, H, W, 3) float32 in [0, 1].
-            mask: (F, H, W, 1) float32 quadmask (0=remove, 0.5=affected, 1=keep).
-            prompt: Text prompt describing the background.
+            mask: (F, H, W, 1) float32 quadmask.
+            prompt: Text prompt.
+            temporal_window: Temporal window size in video frames (default 85).
+            temporal_stride: Overlap stride in video frames (default 16).
 
         Returns:
             (F_out, H, W, 3) float32 output video in [0, 1].
         """
         pipe = self._make_pipeline()
 
-        video_mx = mx.array(video[None])  # (1, F, H, W, 3)
-        mask_1ch = mx.array(mask[None])   # (1, F, H, W, 1)
-
-        # VOID mask processing:
-        # 1. Invert mask: 1-mask (so remove=1, keep=0)
-        # 2. Tile to 3ch (RGB) for VAE encoding
-        # 3. VAE-encode the inverted mask -> 16ch mask latent
-        # 4. VAE-encode the original video (unmasked) -> 16ch video latent
-        inverted_mask_3ch = mx.repeat(1.0 - mask_1ch, 3, axis=-1)  # (1, F, H, W, 3)
-
-        # Encode mask through VAE
-        mask_encoded = self.vae.encode(inverted_mask_3ch).mode() * self.vae.scaling_factor
-        # Encode original video through VAE
-        video_encoded = self.vae.encode(video_mx).mode() * self.vae.scaling_factor
-
-        # Convert to channels-first: (1, F, H, W, C) -> (1, F, C, H, W)
-        mask_cf = mask_encoded.transpose(0, 1, 4, 2, 3)
-        video_cf = video_encoded.transpose(0, 1, 4, 2, 3)
-
-        # Inpaint conditioning: 16ch mask + 16ch video = 32ch
-        inpaint_cf = mx.concatenate([mask_cf, video_cf], axis=2)
-
-        # Latent noise
         if seed is not None:
             mx.random.seed(seed)
 
-        # Encode prompt
+        # Encode inputs
+        video_shape, video_cf, inpaint_cf = self._encode_inputs(video, mask)
+        B, F_vid, H_vid, W_vid, _ = video_shape
+        F_lat = video_cf.shape[1]
+
+        # Prompt
         prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False)
         mx.eval(prompt_embeds)
 
-        # Start from noise
-        latent_shape = video_cf.shape  # (1, F_lat, 16, H_lat, W_lat)
-        noise = mx.random.normal(latent_shape)
-
+        # Noise
+        noise = mx.random.normal(video_cf.shape)
         pipe.scheduler.set_timesteps(num_inference_steps)
         current = pipe.scheduler.add_noise(video_cf, noise, pipe.scheduler.timesteps[0])
 
-        # RoPE
-        B, F_vid, H_vid, W_vid, _ = video_mx.shape
-        F_lat = video_cf.shape[1]
-        image_rotary_emb = pipe._prepare_rotary_embeddings(H_vid, W_vid, F_lat)
+        # Latent temporal window size
+        latent_window = (temporal_window - 1) // 4 + 1
+        latent_stride = temporal_stride // 4
 
-        # Denoising loop (no CFG — guidance_scale=1.0)
         t0 = time.monotonic()
-        for i, t in enumerate(pipe.scheduler.timesteps):
-            t_input = mx.array([float(t)])
-            noise_pred = self.transformer(
-                hidden_states=current,
-                encoder_hidden_states=prompt_embeds,
-                timestep=t_input,
-                inpaint_latents=inpaint_cf,
-                image_rotary_emb=image_rotary_emb,
+
+        if F_lat <= latent_window:
+            # Short video: process all at once
+            rope = pipe._prepare_rotary_embeddings(H_vid, W_vid, F_lat)
+            current = self._denoise_window(
+                current, inpaint_cf, prompt_embeds, rope, pipe.scheduler,
+                pipe.scheduler.timesteps,
             )
-            current = pipe.scheduler.step(noise_pred, t, current)
-            mx.eval(current)
+        else:
+            # Temporal multidiffusion: sliding window with linear blending
+            print(f"  Temporal multidiffusion: {F_lat} latent frames, "
+                  f"window={latent_window}, stride={latent_stride}")
+
+            for i, t in enumerate(pipe.scheduler.timesteps):
+                t_input = mx.array([float(t)])
+
+                # Accumulate predictions with blending weights
+                canvas = mx.zeros_like(current).astype(mx.float32)
+                weights = mx.zeros((1, F_lat, 1, 1, 1), dtype=mx.float32)
+
+                time_beg = 0
+                while time_beg < F_lat:
+                    time_end = min(time_beg + latent_window, F_lat)
+
+                    # Extract window
+                    lat_i = current[:, time_beg:time_end]
+                    inp_i = inpaint_cf[:, time_beg:time_end]
+
+                    # RoPE for this window size
+                    win_len = time_end - time_beg
+                    rope_i = pipe._prepare_rotary_embeddings(H_vid, W_vid, win_len)
+
+                    # Single denoise step on this window
+                    noise_pred_i = self.transformer(
+                        hidden_states=lat_i,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=t_input,
+                        inpaint_latents=inp_i,
+                        image_rotary_emb=rope_i,
+                    )
+                    stepped_i = pipe.scheduler.step(noise_pred_i, t, lat_i)
+                    mx.eval(stepped_i)
+
+                    # Blending weights: linear ramp at overlap edges
+                    w_parts = []
+                    ramp_left = latent_stride if time_beg > 0 else 0
+                    ramp_right = latent_stride if time_end < F_lat else 0
+                    mid = win_len - ramp_left - ramp_right
+
+                    if ramp_left > 0:
+                        w_parts.append(mx.linspace(0, 1, ramp_left + 2)[1:-1].reshape(1, ramp_left, 1, 1, 1))
+                    if mid > 0:
+                        w_parts.append(mx.ones((1, mid, 1, 1, 1)))
+                    if ramp_right > 0:
+                        w_parts.append(mx.linspace(1, 0, ramp_right + 2)[1:-1].reshape(1, ramp_right, 1, 1, 1))
+                    w_i = mx.concatenate(w_parts, axis=1) if len(w_parts) > 1 else w_parts[0]
+
+                    canvas[:, time_beg:time_end] = canvas[:, time_beg:time_end] + stepped_i * w_i
+                    weights[:, time_beg:time_end] = weights[:, time_beg:time_end] + w_i
+
+                    # Slide window
+                    if time_end >= F_lat:
+                        break
+                    time_beg = time_end - latent_stride
+
+                current = canvas / mx.maximum(weights, 1e-8)
+                mx.eval(current)
+
+                if (i + 1) % 10 == 0 or i == 0:
+                    print(f"    Step {i+1}/{num_inference_steps}")
 
         # Decode
         decoded = current.transpose(0, 1, 3, 4, 2) / self.vae.scaling_factor
@@ -226,8 +315,10 @@ class VOIDPipeline:
         mask: np.ndarray,
         prompt: str,
         num_inference_steps: int = 50,
-        guidance_scale: float = 6.0,
+        guidance_scale: float = 1.0,
         seed: int = 42,
+        temporal_window: int = 85,
+        temporal_stride: int = 16,
     ) -> np.ndarray:
         """Run full VOID inference (pass 1 only for now).
 
@@ -244,4 +335,6 @@ class VOIDPipeline:
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             seed=seed,
+            temporal_window=temporal_window,
+            temporal_stride=temporal_stride,
         )
