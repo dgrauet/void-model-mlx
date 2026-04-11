@@ -1,1 +1,7 @@
 *__pycache__*
+*.gif
+*.png
+*.mp4
+weights/
+output*/
+.DS_Store
