@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--pass1", type=str, default="weights/void_pass1.safetensors")
     parser.add_argument("--pass2", type=str, default=None)
     parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--guidance-scale", type=float, default=6.0)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=672)
     parser.add_argument("--max-frames", type=int, default=85)
