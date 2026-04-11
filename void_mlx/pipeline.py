@@ -187,12 +187,15 @@ class VOIDPipeline:
         # Normalize video to [-1, 1] (VAE trained on this range)
         video_mx = mx.array(video[None]) * 2 - 1  # [0,1] -> [-1,1]
         mask_1ch = mx.array(mask[None])
-        # Binarize mask: below 0.5 → 0 (remove), above 0.5 → 1 (keep)
-        # Original pipeline: raw quadmask inverted twice (255-x then 1-x) = net no inversion
-        # So VAE receives: 0 = inpaint region, 1 = keep region
-        mask_binary = mx.where(mask_1ch > 0.5, mx.array(1.0), mx.array(0.0))
-        # Tile to 3ch for VAE encoding (no inversion — matches original double-inversion)
-        mask_3ch = mx.repeat(mask_binary, 3, axis=-1)
+        # Quadmask processing matching original VOID pipeline:
+        # Raw quadmask values (normalized): 0.0=remove, 0.247=overlap, 0.498=affected, 1.0=keep
+        # Original does: invert (255-x), /255, trimask quantize, then 1-x before VAE
+        # Net result for VAE: 0.0=remove/overlap, ~0.5=affected, 1.0=keep
+        mask_proc = mx.where(mask_1ch > 0.75, mx.array(1.0), mask_1ch)
+        mask_proc = mx.where((mask_proc <= 0.75) & (mask_proc >= 0.25), mx.array(0.502), mask_proc)
+        mask_proc = mx.where(mask_proc < 0.25, mx.array(0.0), mask_proc)
+        # Tile to 3ch for VAE encoding
+        mask_3ch = mx.repeat(mask_proc, 3, axis=-1)
 
         mask_latents = []
         video_latents = []
