@@ -1,3 +1,154 @@
+# VOID MLX -- Video Object Removal on Apple Silicon
+
+VOID (Video Object and Interaction Deletion) removes objects from videos while preserving the physical interactions they cause -- shadows, reflections, falling objects, displaced items. This fork runs VOID natively on Apple Silicon using [MLX](https://github.com/ml-explore/mlx), so you can do video inpainting on a Mac without a CUDA GPU.
+
+Based on Netflix's VOID ([arxiv.org/abs/2604.02296](https://arxiv.org/abs/2604.02296)).
+
+---
+
+## How It Works
+
+VOID uses a two-pass inference pipeline built on CogVideoX:
+
+1. **Pass 1 (Base inpainting)** -- The model removes the masked object and hallucinate the background, conditioned on a quadmask that distinguishes the object from its interaction region.
+2. **Pass 2 (Warped noise refinement)** -- Optical flow from the Pass 1 output is used to warp noise, giving the second pass a temporally coherent starting point. This improves consistency across frames.
+
+You can run Pass 1 alone for faster results, or chain both passes for better temporal quality.
+
+### Quadmask Format
+
+VOID uses a 4-value mask encoding instead of a simple binary mask:
+
+| Pixel Value | Meaning |
+|-------------|---------|
+| `0` | Object to remove |
+| `63` | Overlap region (object + affected area) |
+| `127` | Affected region (items displaced by interactions) |
+| `255` | Background (keep as-is) |
+
+---
+
+## Models
+
+All weights are on HuggingFace. Pick a VOID quantization level based on your available memory:
+
+| Model | Format | Notes |
+|-------|--------|-------|
+| [dgrauet/void-model-mlx](https://huggingface.co/dgrauet/void-model-mlx) | bf16 | Full precision |
+| [dgrauet/void-model-mlx-q8](https://huggingface.co/dgrauet/void-model-mlx-q8) | int8 | Good balance of quality and memory |
+| [dgrauet/void-model-mlx-q4](https://huggingface.co/dgrauet/void-model-mlx-q4) | int4 | Smallest, fits on 32GB Macs |
+
+You also need the base CogVideoX inpainting model:
+
+| Model | Format |
+|-------|--------|
+| [dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q8](https://huggingface.co/dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q8) | int8 |
+
+Download them with `huggingface-cli`:
+
+```bash
+# VOID weights (pick one)
+huggingface-cli download dgrauet/void-model-mlx-q4 --local-dir weights/
+
+# Base model
+huggingface-cli download dgrauet/CogVideoX-Fun-V1.5-5b-InP-mlx-q8 \
+    --local-dir models/CogVideoX-Fun-V1.5-5b-InP-mlx-q8
+```
+
+---
+
+## Quick Start
+
+### 1. Install Dependencies
+
+VOID MLX depends on [VideoX-Fun-mlx](https://github.com/dgrauet/VideoX-Fun-mlx) for the CogVideoX backbone.
+
+```bash
+# Clone VideoX-Fun-mlx
+git clone https://github.com/dgrauet/VideoX-Fun-mlx.git
+export VIDEOX_FUN_MLX_PATH=/path/to/VideoX-Fun-mlx
+
+# Install Python dependencies
+pip install mlx opencv-python-headless pillow numpy sentencepiece
+```
+
+### 2. Run Inference
+
+The repo includes test sequences in the `sample/` directory (`BigBen`, `moving_ball`, `spinner`, `lime`, `pillow`, `trampoline`, etc.).
+
+```bash
+python -m void_mlx.infer \
+    --sample sample/BigBen \
+    --pass1 weights/void_pass1.safetensors \
+    --pass2 weights/void_pass2.safetensors \
+    --base-model /path/to/CogVideoX-Fun-V1.5-5b-InP-mlx-q8 \
+    --steps 30 --max-frames 13 --height 352 --width 624 \
+    --output result.gif
+```
+
+Drop `--pass2` to run a single pass (faster, still good quality for short clips).
+
+### 3. Memory Requirements
+
+| Setup | RAM Needed |
+|-------|-----------|
+| q4 VOID + q8 base, 13 frames at 352x624 | ~32 GB |
+| q8 VOID + q8 base, 13 frames at 352x624 | ~48 GB |
+| bf16 VOID + q8 base | 64+ GB |
+
+A 32 GB MacBook Pro or Mac Mini can run the q4 configuration. Reduce `--max-frames`, `--height`, or `--width` if you hit memory limits.
+
+---
+
+## Input Format
+
+Each sample is a directory containing:
+
+```
+sample/BigBen/
+  input_video.mp4       # source video
+  quadmask_0.mp4        # 4-value quadmask (or trimask_quadmask.mp4)
+  prompt.json           # {"bg": "description of the background after removal"}
+```
+
+The `prompt.json` describes what the scene looks like **after** the object is gone. Do not describe the object being removed.
+
+---
+
+## Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `VIDEOX_FUN_MLX_PATH` | Path to your local [VideoX-Fun-mlx](https://github.com/dgrauet/VideoX-Fun-mlx) clone |
+
+---
+
+## Related Projects
+
+- [VideoX-Fun-mlx](https://github.com/dgrauet/VideoX-Fun-mlx) -- CogVideoX inference backbone for MLX
+- [mlx-forge](https://github.com/dgrauet/mlx-forge) -- Model conversion and quantization tools for MLX
+- [mlx-ops](https://github.com/dgrauet/mlx-ops) -- Custom MLX operations
+
+---
+
+## Credits
+
+- **Netflix VOID team** -- Saman Motamed, William Harvey, Benjamin Klein, Luc Van Gool, Zhuoning Yuan, Ta-Ying Cheng. Paper: [arxiv.org/abs/2604.02296](https://arxiv.org/abs/2604.02296)
+- Built on [CogVideoX](https://github.com/THUDM/CogVideo) and [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun)
+
+## License
+
+Apache 2.0 -- see [LICENSE](LICENSE).
+
+---
+---
+
+# Original VOID README (reference)
+
+The rest of this file is the original README from [netflix/void-model](https://github.com/netflix/void-model), preserved for reference. The mask pipeline, training instructions, and GPU-based inference documented below apply to the original PyTorch version, not the MLX port above.
+
+---
+
 <div align="center">
 <img src="assets/void-logo-web.png" width="195" />
 </div>
