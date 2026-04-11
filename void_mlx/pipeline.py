@@ -103,9 +103,17 @@ class VOIDPipeline:
                 sched_config.pop(k, None)
         self.sched_config = sched_config
 
-        # Load transformer with pass1 weights
-        print("Loading transformer + VOID pass1 weights...")
-        self.transformer = CogVideoXTransformer3DModel.from_pretrained(base_model_path)
+        # Load transformer with VOID pass1 weights
+        # VOID uses 48 input channels (16 latent + 16 VAE-mask + 16 VAE-video)
+        # vs base model's 33 channels (16 + 17)
+        print("Loading transformer (in_channels=48 for VOID)...")
+        self.transformer = CogVideoXTransformer3DModel.from_pretrained(
+            base_model_path,
+            transformer_additional_kwargs={"in_channels": 48},
+        )
+        # Base model weights have patch_embed for 33ch — load with strict=False
+        # then VOID weights overwrite everything including the correct patch_embed
+        print("  Loading VOID pass1 weights...")
         load_void_weights(self.transformer, pass1_checkpoint)
         print("  VOID pass1 loaded.")
 
@@ -125,34 +133,88 @@ class VOIDPipeline:
         mask: np.ndarray,
         prompt: str,
         num_inference_steps: int = 50,
-        guidance_scale: float = 6.0,
+        guidance_scale: float = 1.0,
         seed: int = 42,
     ) -> np.ndarray:
         """Run VOID pass 1 (base inpainting with quadmask).
 
+        VOID uses VAE-encoded mask (16ch) instead of raw 1ch mask.
+        The mask is inverted (1-mask), tiled to 3ch RGB, and encoded by VAE.
+        The masked_video is the original video (not zeroed out).
+        guidance_scale defaults to 1.0 (VOID doesn't use CFG).
+
         Args:
             video: (F, H, W, 3) float32 in [0, 1].
-            mask: (F, H, W, 1) float32 quadmask.
-            prompt: Text prompt.
+            mask: (F, H, W, 1) float32 quadmask (0=remove, 0.5=affected, 1=keep).
+            prompt: Text prompt describing the background.
 
         Returns:
             (F_out, H, W, 3) float32 output video in [0, 1].
         """
         pipe = self._make_pipeline()
 
-        video_mx = mx.array(video[None])
-        mask_mx = mx.array(mask[None])
+        video_mx = mx.array(video[None])  # (1, F, H, W, 3)
+        mask_1ch = mx.array(mask[None])   # (1, F, H, W, 1)
 
+        # VOID mask processing:
+        # 1. Invert mask: 1-mask (so remove=1, keep=0)
+        # 2. Tile to 3ch (RGB) for VAE encoding
+        # 3. VAE-encode the inverted mask -> 16ch mask latent
+        # 4. VAE-encode the original video (unmasked) -> 16ch video latent
+        inverted_mask_3ch = mx.repeat(1.0 - mask_1ch, 3, axis=-1)  # (1, F, H, W, 3)
+
+        # Encode mask through VAE
+        mask_encoded = self.vae.encode(inverted_mask_3ch).mode() * self.vae.scaling_factor
+        # Encode original video through VAE
+        video_encoded = self.vae.encode(video_mx).mode() * self.vae.scaling_factor
+
+        # Convert to channels-first: (1, F, H, W, C) -> (1, F, C, H, W)
+        mask_cf = mask_encoded.transpose(0, 1, 4, 2, 3)
+        video_cf = video_encoded.transpose(0, 1, 4, 2, 3)
+
+        # Inpaint conditioning: 16ch mask + 16ch video = 32ch
+        inpaint_cf = mx.concatenate([mask_cf, video_cf], axis=2)
+
+        # Latent noise
+        if seed is not None:
+            mx.random.seed(seed)
+
+        # Encode prompt
+        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False)
+        mx.eval(prompt_embeds)
+
+        # Start from noise
+        latent_shape = video_cf.shape  # (1, F_lat, 16, H_lat, W_lat)
+        noise = mx.random.normal(latent_shape)
+
+        pipe.scheduler.set_timesteps(num_inference_steps)
+        current = pipe.scheduler.add_noise(video_cf, noise, pipe.scheduler.timesteps[0])
+
+        # RoPE
+        B, F_vid, H_vid, W_vid, _ = video_mx.shape
+        F_lat = video_cf.shape[1]
+        image_rotary_emb = pipe._prepare_rotary_embeddings(H_vid, W_vid, F_lat)
+
+        # Denoising loop (no CFG — guidance_scale=1.0)
         t0 = time.monotonic()
-        output = pipe(
-            video=video_mx,
-            mask=mask_mx,
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-        )
+        for i, t in enumerate(pipe.scheduler.timesteps):
+            t_input = mx.array([float(t)])
+            noise_pred = self.transformer(
+                hidden_states=current,
+                encoder_hidden_states=prompt_embeds,
+                timestep=t_input,
+                inpaint_latents=inpaint_cf,
+                image_rotary_emb=image_rotary_emb,
+            )
+            current = pipe.scheduler.step(noise_pred, t, current)
+            mx.eval(current)
+
+        # Decode
+        decoded = current.transpose(0, 1, 3, 4, 2) / self.vae.scaling_factor
+        output = self.vae.decode(decoded)
+        output = mx.clip(output / 2 + 0.5, 0, 1)
         mx.eval(output)
+
         elapsed = time.monotonic() - t0
         print(f"  Pass 1: {elapsed:.1f}s ({elapsed/num_inference_steps:.1f}s/step)")
 
