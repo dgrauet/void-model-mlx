@@ -78,6 +78,52 @@ def load_void_weights(transformer: CogVideoXTransformer3DModel, checkpoint_path:
     transformer.load_weights(list(weights.items()), strict=False)
 
 
+def _create_and_load_void_transformer(base_model_path: str, checkpoint_path: str):
+    """Create transformer with VOID config and load weights directly.
+
+    Avoids loading base model weights (saves ~6GB RAM).
+    """
+    import json
+
+    # Read transformer config from base model
+    tf_config_file = os.path.join(base_model_path, "transformer_config.json")
+    if not os.path.exists(tf_config_file):
+        cfg_root = os.path.join(base_model_path, "config.json")
+        with open(cfg_root) as f:
+            cfg = json.load(f)
+        tf_config = cfg.get("transformer", cfg)
+    else:
+        with open(tf_config_file) as f:
+            tf_config = json.load(f)
+
+    # Override in_channels for VOID (48 instead of 33)
+    init_keys = {
+        "num_attention_heads", "attention_head_dim", "in_channels", "out_channels",
+        "flip_sin_to_cos", "freq_shift", "time_embed_dim", "text_embed_dim",
+        "num_layers", "dropout", "attention_bias", "sample_width", "sample_height",
+        "sample_frames", "patch_size", "patch_size_t", "temporal_compression_ratio",
+        "max_text_seq_length", "activation_fn", "timestep_activation_fn",
+        "norm_elementwise_affine", "norm_eps", "spatial_interpolation_scale",
+        "temporal_interpolation_scale", "use_rotary_positional_embeddings",
+        "use_learned_positional_embeddings", "patch_bias",
+    }
+    filtered = {k: v for k, v in tf_config.items() if k in init_keys}
+    filtered["in_channels"] = 48
+
+    # Create empty model
+    model = CogVideoXTransformer3DModel(**filtered)
+
+    # Load VOID weights directly (no base model weights loaded first)
+    load_void_weights(model, checkpoint_path)
+
+    import mlx.nn
+    leaves = mlx.nn.utils.tree_flatten(model.trainable_parameters())
+    param_count = sum(v.size for _, v in leaves)
+    print(f"  Transformer: {param_count / 1e6:.1f}M parameters")
+
+    return model
+
+
 class VOIDPipeline:
     """VOID two-pass video inpainting pipeline for MLX."""
 
@@ -110,18 +156,13 @@ class VOIDPipeline:
                 sched_config.pop(k, None)
         self.sched_config = sched_config
 
-        # Load transformer with VOID pass1 weights
-        # VOID uses 48 input channels (16 latent + 16 VAE-mask + 16 VAE-video)
-        # vs base model's 33 channels (16 + 17)
+        # Create transformer architecture (48ch for VOID) and load VOID weights
+        # directly — skip loading base model weights to save memory.
+        # VOID checkpoints contain ALL transformer weights.
         print("Loading transformer (in_channels=48 for VOID)...")
-        self.transformer = CogVideoXTransformer3DModel.from_pretrained(
-            base_model_path,
-            transformer_additional_kwargs={"in_channels": 48},
+        self.transformer = _create_and_load_void_transformer(
+            base_model_path, pass1_checkpoint,
         )
-        # Base model weights have patch_embed for 33ch — load with strict=False
-        # then VOID weights overwrite everything including the correct patch_embed
-        print("  Loading VOID pass1 weights...")
-        load_void_weights(self.transformer, pass1_checkpoint)
         print("  VOID pass1 loaded.")
 
     def _make_pipeline(self) -> CogVideoXFunInpaintPipeline:
