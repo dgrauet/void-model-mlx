@@ -12,6 +12,27 @@ import numpy as np
 from pathlib import Path
 
 
+def adjust_frame_count(num_frames: int, temporal_compression: int = 4, patch_size_t: int = 2) -> int:
+    """Adjust frame count to be compatible with the model architecture.
+
+    The VAE compresses temporally by `temporal_compression` (4x), and
+    the transformer patches temporally by `patch_size_t` (2x).
+    The number of latent frames must be divisible by patch_size_t.
+
+    Latent frames = (F - 1) // temporal_compression + 1
+    This must be divisible by patch_size_t.
+
+    Valid F values: 5, 13, 21, 29, 37, 45, 53, 61, 69, 77, 85, ...
+
+    Returns the largest valid F <= num_frames.
+    """
+    for f in range(num_frames, 0, -1):
+        latent_f = (f - 1) // temporal_compression + 1
+        if latent_f % patch_size_t == 0 and latent_f >= 2:
+            return f
+    return 5  # minimum valid
+
+
 def load_quadmask_video(path: str, height: int, width: int, max_frames: int) -> np.ndarray:
     """Load a quadmask video and normalize to [0, 1] with 4 discrete values.
 
@@ -83,6 +104,9 @@ def load_video(path: str, height: int, width: int, max_frames: int) -> np.ndarra
 def load_sample(sample_dir: str, height: int = 384, width: int = 672, max_frames: int = 85):
     """Load a VOID sample (video + quadmask + prompt).
 
+    Automatically adjusts max_frames to be compatible with the model
+    (latent frame count must be divisible by patch_size_t=2).
+
     Args:
         sample_dir: Path to sample directory containing:
             - input_video.mp4
@@ -97,6 +121,12 @@ def load_sample(sample_dir: str, height: int = 384, width: int = 672, max_frames
     """
     import json
     sample_dir = Path(sample_dir)
+
+    # Adjust frame count for model compatibility
+    adjusted = adjust_frame_count(max_frames)
+    if adjusted != max_frames:
+        print(f"  Adjusted frames: {max_frames} -> {adjusted} (must produce even latent frames)")
+    max_frames = adjusted
 
     # Load video
     video_path = sample_dir / "input_video.mp4"

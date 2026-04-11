@@ -261,6 +261,16 @@ class VOIDPipeline:
         B, F_vid, H_vid, W_vid, _ = video_shape
         F_lat = video_cf.shape[1]
 
+        # Verify latent frame count is compatible with patch_size_t
+        p_t = self.transformer._config.get("patch_size_t", 2) or 2
+        if F_lat % p_t != 0:
+            from void_mlx.mask_utils import adjust_frame_count
+            valid_f = adjust_frame_count(video.shape[0])
+            raise ValueError(
+                f"Latent frames ({F_lat}) not divisible by patch_size_t ({p_t}). "
+                f"Use --max-frames {valid_f} instead of {video.shape[0]}."
+            )
+
         # Prompt
         prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False)
         mx.eval(prompt_embeds)
