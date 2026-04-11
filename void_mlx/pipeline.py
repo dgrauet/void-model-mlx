@@ -35,15 +35,20 @@ from videox_fun_mlx.pipeline.scheduler import DDIMScheduler
 def load_void_weights(transformer: CogVideoXTransformer3DModel, checkpoint_path: str):
     """Load VOID checkpoint weights into an existing transformer.
 
-    Handles the patch_embed.proj.weight channel mismatch:
-    VOID checkpoints may have different channel counts than the base model.
-    The first and last 128 channels are copied from the checkpoint,
-    middle channels keep the base model's pretrained weights.
+    Supports both PyTorch (.safetensors with 3D+ conv weights) and
+    MLX-converted (already transposed, possibly quantized) formats.
     """
     from videox_fun_mlx.utils import convert_pytorch_weights
 
     weights = mx.load(checkpoint_path)
-    weights = convert_pytorch_weights(weights)
+
+    # Detect if already MLX format: quantized weights have .scales keys
+    has_scales = any(k.endswith(".scales") for k in weights)
+    has_3d_weights = any(w.ndim >= 3 for w in weights.values() if isinstance(w, mx.array))
+
+    if has_3d_weights and not has_scales:
+        # PyTorch format — needs conv transposition
+        weights = convert_pytorch_weights(weights)
 
     # Handle patch_embed.proj.weight channel mismatch
     pe_key = "patch_embed.proj.weight"
@@ -55,18 +60,20 @@ def load_void_weights(transformer: CogVideoXTransformer3DModel, checkpoint_path:
             model_w = model_leaves[pe_key]
             if void_w.shape != model_w.shape:
                 print(f"  Adapting {pe_key}: {void_w.shape} -> {model_w.shape}")
-                feat_dim = 128  # 16 latent_ch * 8 feat_scale
+                feat_dim = 128
                 new_w = mx.array(model_w)
                 if void_w.ndim == 2:
-                    # Copy first feat_dim and last feat_dim from checkpoint
                     first = void_w[:, :feat_dim]
                     last = void_w[:, -feat_dim:]
-                    new_w = mx.concatenate([
-                        first,
-                        new_w[:, feat_dim:-feat_dim],
-                        last,
-                    ], axis=1)
+                    new_w = mx.concatenate([first, new_w[:, feat_dim:-feat_dim], last], axis=1)
                 weights[pe_key] = new_w
+
+    # If quantized, convert Linear -> QuantizedLinear before loading
+    if has_scales:
+        from videox_fun_mlx.utils import quantize_model_from_weights, get_quantize_config
+        # Build a fake path for quantize config
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        quantize_model_from_weights(transformer, weights, ckpt_dir, "transformer")
 
     transformer.load_weights(list(weights.items()), strict=False)
 
