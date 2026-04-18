@@ -127,7 +127,7 @@ The `prompt.json` describes what the scene looks like **after** the object is go
 
 - [VideoX-Fun-mlx](https://github.com/dgrauet/VideoX-Fun-mlx) -- CogVideoX inference backbone for MLX
 - [mlx-forge](https://github.com/dgrauet/mlx-forge) -- Model conversion and quantization tools for MLX
-- [mlx-ops](https://github.com/dgrauet/mlx-ops) -- Custom MLX operations
+- [mlx-arsenal](https://github.com/dgrauet/mlx-arsenal) -- Custom MLX operations
 
 ---
 
