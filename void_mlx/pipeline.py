@@ -124,6 +124,13 @@ def _create_and_load_void_transformer(base_model_path: str, checkpoint_path: str
     return model
 
 
+# Mirror of the reference execution dtype (`weight_dtype = torch.bfloat16`
+# in inference_with_pass1_warped_noise.py:280) — transformer, VAE and T5 all
+# run bf16; fp32 islands are limited to the ones upstream keeps (time_proj
+# tables, RoPE tables, scheduler.step promotion) each followed by a cast back.
+WEIGHT_DTYPE = mx.bfloat16
+
+
 class VOIDPipeline:
     """VOID two-pass video inpainting pipeline for MLX."""
 
@@ -185,7 +192,7 @@ class VOIDPipeline:
         """
         F = video.shape[0]
         # Normalize video to [-1, 1] (VAE trained on this range)
-        video_mx = mx.array(video[None]) * 2 - 1  # [0,1] -> [-1,1]
+        video_mx = (mx.array(video[None]) * 2 - 1).astype(WEIGHT_DTYPE)  # [0,1] -> [-1,1]
         mask_1ch = mx.array(mask[None])
         # Quadmask processing matching original VOID pipeline:
         # Raw quadmask values (normalized): 0.0=remove, 0.247=overlap, 0.498=affected, 1.0=keep
@@ -195,7 +202,7 @@ class VOIDPipeline:
         mask_proc = mx.where((mask_proc <= 0.75) & (mask_proc >= 0.25), mx.array(0.502), mask_proc)
         mask_proc = mx.where(mask_proc < 0.25, mx.array(0.0), mask_proc)
         # Tile to 3ch for VAE encoding
-        mask_3ch = mx.repeat(mask_proc, 3, axis=-1)
+        mask_3ch = mx.repeat(mask_proc, 3, axis=-1).astype(WEIGHT_DTYPE)
 
         mask_latents = []
         video_latents = []
@@ -231,7 +238,9 @@ class VOIDPipeline:
                 inpaint_latents=inpaint,
                 image_rotary_emb=rope,
             )
-            current = scheduler.step(noise_pred, t, current)
+            # scheduler.step promotes to fp32 (iso torch); the reference
+            # casts latents back to the model dtype after every step (:1170).
+            current = scheduler.step(noise_pred, t, current).astype(latents.dtype)
             mx.eval(current)
         return current
 
@@ -279,11 +288,14 @@ class VOIDPipeline:
             )
 
         # Prompt
-        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False)
+        # Mirror reference prepare (pipeline...py:380): prompt embeds cast
+        # to the execution dtype — fp32 T5 output would otherwise promote
+        # the whole DiT via the text/video concat in patch_embed.
+        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False).astype(WEIGHT_DTYPE)
         mx.eval(prompt_embeds)
 
         # Noise
-        noise = mx.random.normal(video_cf.shape)
+        noise = mx.random.normal(video_cf.shape).astype(video_cf.dtype)
         pipe.scheduler.set_timesteps(num_inference_steps)
         current = pipe.scheduler.add_noise(video_cf, noise, pipe.scheduler.timesteps[0])
 
@@ -332,7 +344,7 @@ class VOIDPipeline:
                         inpaint_latents=inp_i,
                         image_rotary_emb=rope_i,
                     )
-                    stepped_i = pipe.scheduler.step(noise_pred_i, t, lat_i)
+                    stepped_i = pipe.scheduler.step(noise_pred_i, t, lat_i).astype(lat_i.dtype)
                     mx.eval(stepped_i)
 
                     # Blending weights: linear ramp at overlap edges
@@ -357,7 +369,9 @@ class VOIDPipeline:
                         break
                     time_beg = time_end - latent_stride
 
-                current = canvas / mx.maximum(weights, 1e-8)
+                # fp32 blending accumulator; return to the model dtype for
+                # the next timestep's transformer input.
+                current = (canvas / mx.maximum(weights, 1e-8)).astype(WEIGHT_DTYPE)
                 mx.eval(current)
 
                 if (i + 1) % 10 == 0 or i == 0:
@@ -418,14 +432,17 @@ class VOIDPipeline:
             latent_channels=C_lat, seed=seed,
         )
         # (F_lat, H_lat, W_lat, C_lat) -> (1, F_lat, C_lat, H_lat, W_lat)
-        warped_cf = mx.array(warped[None]).transpose(0, 1, 4, 2, 3)
+        warped_cf = mx.array(warped[None]).transpose(0, 1, 4, 2, 3).astype(WEIGHT_DTYPE)
 
         # Load pass 2 weights
         print("  Loading VOID pass2 weights...")
         load_void_weights(self.transformer, self.pass2_checkpoint)
 
         # Prompt
-        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False)
+        # Mirror reference prepare (pipeline...py:380): prompt embeds cast
+        # to the execution dtype — fp32 T5 output would otherwise promote
+        # the whole DiT via the text/video concat in patch_embed.
+        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False).astype(WEIGHT_DTYPE)
         mx.eval(prompt_embeds)
 
         # Use warped noise as starting point (replaces random noise)
