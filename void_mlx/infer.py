@@ -29,6 +29,11 @@ def main():
     parser.add_argument("--width", type=int, default=672)
     parser.add_argument("--max-frames", type=int, default=85)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--low-ram", action="store_true",
+        help="Free the T5 text encoder after prompt encoding (~9.5 GB); "
+             "reloaded lazily for a new prompt. For 32 GB Macs.",
+    )
     parser.add_argument("--output", type=str, default="void_output.gif")
     args = parser.parse_args()
 
@@ -52,6 +57,7 @@ def main():
         base_model_path=args.base_model,
         pass1_checkpoint=args.pass1,
         pass2_checkpoint=args.pass2,
+        low_ram=args.low_ram,
     )
 
     # Run inference

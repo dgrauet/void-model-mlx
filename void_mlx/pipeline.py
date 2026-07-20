@@ -7,6 +7,7 @@ Two-pass video inpainting:
 Uses the VideoX-Fun-mlx pipeline as the inference engine.
 """
 
+import gc
 import os
 import sys
 import time
@@ -139,10 +140,17 @@ class VOIDPipeline:
         base_model_path: str,
         pass1_checkpoint: str,
         pass2_checkpoint: Optional[str] = None,
+        low_ram: bool = False,
     ):
         self.base_model_path = base_model_path
         self.pass1_checkpoint = pass1_checkpoint
         self.pass2_checkpoint = pass2_checkpoint
+        # low_ram frees T5 (~9.5 GB bf16) after each prompt encode and
+        # reloads it lazily for a new prompt — same trade-off as
+        # ltx-2-mlx's low_memory Gemma freeing. Off by default: with
+        # enough RAM, keeping T5 resident matches the reference
+        # ("model loaded ONCE") and avoids reload cost in batch use.
+        self.low_ram = low_ram
 
         # Load shared components
         print("Loading VAE...")
@@ -170,7 +178,48 @@ class VOIDPipeline:
         self.transformer = _create_and_load_void_transformer(
             base_model_path, pass1_checkpoint,
         )
+        self._loaded_checkpoint = pass1_checkpoint
+        self._prompt_cache: dict = {}
         print("  VOID pass1 loaded.")
+
+    def _ensure_checkpoint(self, checkpoint_path: str) -> None:
+        """Load transformer weights only when they differ from the resident
+        ones. The reference runs each pass in its own process; this merged
+        pipeline used to reload pass1 eagerly at the END of run_pass2 —
+        10 GB of load work inside the final decode memory window."""
+        if self._loaded_checkpoint == checkpoint_path:
+            return
+        load_void_weights(self.transformer, checkpoint_path)
+        self._loaded_checkpoint = checkpoint_path
+
+    def _encode_prompt(self, pipe, prompt: str) -> mx.array:
+        """Encode once per prompt, then free T5.
+
+        T5-XXL bf16 is ~9.5 GB and is only needed to embed one prompt
+        (identical in both passes); keeping it resident put the whole run
+        ~9.5 GB higher (plateau 21.6 GB, transition spike 35.3 GB = 131 %
+        of the working-set budget). Lazily reloaded for a new prompt.
+        """
+        cached = self._prompt_cache.get(prompt)
+        if cached is not None:
+            return cached
+        if self.t5 is None:
+            print("  Reloading T5 text encoder (new prompt)...")
+            self.t5 = T5Encoder.from_pretrained(self.base_model_path)
+            self.tokenizer = T5Tokenizer(self.base_model_path)
+        pipe.text_encoder = self.t5
+        pipe.tokenizer = self.tokenizer
+        embeds = pipe.encode_prompt(prompt, "", do_cfg=False).astype(WEIGHT_DTYPE)
+        mx.eval(embeds)
+        self._prompt_cache = {prompt: embeds}
+        if self.low_ram:
+            self.t5 = None
+            self.tokenizer = None
+            pipe.text_encoder = None
+            pipe.tokenizer = None
+            gc.collect()
+            mx.clear_cache()
+        return embeds
 
     def _make_pipeline(self) -> CogVideoXFunInpaintPipeline:
         scheduler = DDIMScheduler(**self.sched_config)
@@ -268,6 +317,7 @@ class VOIDPipeline:
             (F_out, H, W, 3) float32 output video in [0, 1].
         """
         pipe = self._make_pipeline()
+        self._ensure_checkpoint(self.pass1_checkpoint)
 
         if seed is not None:
             mx.random.seed(seed)
@@ -289,9 +339,9 @@ class VOIDPipeline:
 
         # Prompt
         # Mirror reference prepare (pipeline...py:380): prompt embeds cast
-        # to the execution dtype — fp32 T5 output would otherwise promote
-        # the whole DiT via the text/video concat in patch_embed.
-        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False).astype(WEIGHT_DTYPE)
+        # to the execution dtype; encoded once per prompt with T5 freed after
+        # (see _encode_prompt).
+        prompt_embeds = self._encode_prompt(pipe, prompt)
         mx.eval(prompt_embeds)
 
         # Noise
@@ -434,15 +484,15 @@ class VOIDPipeline:
         # (F_lat, H_lat, W_lat, C_lat) -> (1, F_lat, C_lat, H_lat, W_lat)
         warped_cf = mx.array(warped[None]).transpose(0, 1, 4, 2, 3).astype(WEIGHT_DTYPE)
 
-        # Load pass 2 weights
+        # Load pass 2 weights (lazy/deduplicated)
         print("  Loading VOID pass2 weights...")
-        load_void_weights(self.transformer, self.pass2_checkpoint)
+        self._ensure_checkpoint(self.pass2_checkpoint)
 
         # Prompt
         # Mirror reference prepare (pipeline...py:380): prompt embeds cast
-        # to the execution dtype — fp32 T5 output would otherwise promote
-        # the whole DiT via the text/video concat in patch_embed.
-        prompt_embeds = pipe.encode_prompt(prompt, "", do_cfg=False).astype(WEIGHT_DTYPE)
+        # to the execution dtype; encoded once per prompt with T5 freed after
+        # (see _encode_prompt).
+        prompt_embeds = self._encode_prompt(pipe, prompt)
         mx.eval(prompt_embeds)
 
         # Use warped noise as starting point (replaces random noise)
@@ -468,8 +518,8 @@ class VOIDPipeline:
         elapsed = time.monotonic() - t0
         print(f"  Pass 2: {elapsed:.1f}s ({elapsed/num_inference_steps:.1f}s/step)")
 
-        # Reload pass 1 weights for next run
-        load_void_weights(self.transformer, self.pass1_checkpoint)
+        # pass1 weights are reloaded lazily by the next run_pass1 call
+        # (_ensure_checkpoint) — not here, inside the decode memory window.
 
         return np.array(output[0].astype(mx.float32))
 
