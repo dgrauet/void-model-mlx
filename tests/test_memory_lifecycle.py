@@ -168,3 +168,38 @@ class TestTransitionWindow:
                 "is released, and _prepare_rotary_embeddings reads its _config "
                 "(crash found by the e2e run, session void-transition-fix)"
             )
+
+
+class TestLowRamCachePolicy:
+    """low-ram: MLX cache limit 0 (ltx low_ram_streaming precedent).
+
+    Without it, VOID's pass2 ran at 94-95% of the working-set budget while
+    MLX active was only 12 GB — 13-25 GB of freed transition buffers
+    (pass1 decode, re-encode) retained as cache, never reusable by the
+    denoise (smeltr `memory --timeline`, session void-transition-fix2).
+    Nothing in the VOID/VideoX chain calls set_cache_limit elsewhere
+    (the ltx-2-mlx#79 clobber lesson).
+    """
+
+    def test_low_ram_sets_cache_limit_zero(self, pipe, monkeypatch):
+        calls = []
+        monkeypatch.setattr(vp.mx, "set_cache_limit", lambda n: calls.append(n) or 0)
+        pipe.low_ram = True
+        pipe._apply_cache_policy()
+        assert calls == [0]
+
+    def test_default_leaves_cache_limit_alone(self, pipe, monkeypatch):
+        calls = []
+        monkeypatch.setattr(vp.mx, "set_cache_limit", lambda n: calls.append(n) or 0)
+        pipe.low_ram = False
+        pipe._apply_cache_policy()
+        assert calls == []
+
+    def test_ctor_applies_the_policy(self):
+        import inspect
+
+        src = inspect.getsource(vp.VOIDPipeline.__init__)
+        assert "_apply_cache_policy" in src, (
+            "ctor must apply the cache policy BEFORE any model load so "
+            "load-time temporaries are not retained either"
+        )

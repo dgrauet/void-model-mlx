@@ -151,6 +151,8 @@ class VOIDPipeline:
         # enough RAM, keeping T5 resident matches the reference
         # ("model loaded ONCE") and avoids reload cost in batch use.
         self.low_ram = low_ram
+        # Before any model load, so load-time temporaries are not retained.
+        self._apply_cache_policy()
 
         # Load shared components
         print("Loading VAE...")
@@ -199,6 +201,19 @@ class VOIDPipeline:
         else:
             load_void_weights(self.transformer, checkpoint_path)
         self._loaded_checkpoint = checkpoint_path
+
+    def _apply_cache_policy(self) -> None:
+        """low-ram: MLX cache limit 0 — freed buffers return to the OS.
+
+        Without it, pass2 ran at 94-95 % of the working-set budget while
+        MLX active was only 12 GB: 13-25 GB of freed transition buffers
+        (pass1 decode, re-encode) retained as cache, never reusable by
+        the denoise. Framework-constraint mitigation (the MLX cache has
+        no CUDA equivalent), same policy as ltx-2-mlx low_ram_streaming.
+        Default mode leaves the allocator untouched.
+        """
+        if self.low_ram:
+            mx.set_cache_limit(0)
 
     def _release_transformer(self) -> None:
         """Drop the transformer (~10 GB bf16) ahead of a VAE decode window;
