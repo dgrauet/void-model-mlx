@@ -108,3 +108,63 @@ class TestDefaultKeepsT5Resident:
         assert pipe.t5 is t5, "default mode must keep T5 resident"
         e2 = pipe._encode_prompt(stub, "a prompt")
         assert stub.encode_calls == 1 and e2 is e1
+
+
+class TestTransitionWindow:
+    """low-ram: the transformer (~10 GB) must not sit through the VAE decode
+    windows — it is released before decode and lazily rebuilt on the next
+    _ensure_checkpoint (measured transition spike: 115% of budget with it
+    resident)."""
+
+    def test_release_then_ensure_rebuilds(self, pipe, monkeypatch):
+        created = []
+        monkeypatch.setattr(
+            vp, "_create_and_load_void_transformer",
+            lambda base, ckpt: created.append(ckpt) or object(),
+        )
+        loads = []
+        monkeypatch.setattr(vp, "load_void_weights", lambda tf, p: loads.append(p))
+        pipe.transformer = object()
+
+        pipe._release_transformer()
+        assert pipe.transformer is None
+        assert pipe._loaded_checkpoint is None
+
+        pipe._ensure_checkpoint("p2.safetensors")
+        assert created == ["p2.safetensors"], "must rebuild from scratch after release"
+        assert loads == [], "no double-load on the rebuild path"
+        assert pipe._loaded_checkpoint == "p2.safetensors"
+
+    def test_decode_latents_releases_only_in_low_ram(self, pipe, monkeypatch):
+        class StubVAE:
+            scaling_factor = 1.0
+            def decode(self, x):
+                return x
+
+        pipe.vae = StubVAE()
+        pipe.transformer = object()
+        latents = mx.zeros((1, 2, 4, 4, 4), dtype=vp.WEIGHT_DTYPE)
+
+        pipe.low_ram = False
+        pipe._decode_latents(latents)
+        assert pipe.transformer is not None, "default mode keeps the transformer"
+
+        pipe.low_ram = True
+        pipe._decode_latents(latents)
+        assert pipe.transformer is None, "low-ram must release before decoding"
+
+    def test_both_passes_decode_through_the_helper(self):
+        import inspect
+
+        for meth in (vp.VOIDPipeline.run_pass1, vp.VOIDPipeline.run_pass2):
+            src = inspect.getsource(meth)
+            assert "_decode_latents" in src, meth.__name__
+            assert "self.vae.decode" not in src, (
+                f"{meth.__name__} must not decode inline (bypasses the release)"
+            )
+            assert "pipe.transformer = self.transformer" in src, (
+                f"{meth.__name__} must rebind pipe.transformer after "
+                "_ensure_checkpoint — pipe can be built while the transformer "
+                "is released, and _prepare_rotary_embeddings reads its _config "
+                "(crash found by the e2e run, session void-transition-fix)"
+            )

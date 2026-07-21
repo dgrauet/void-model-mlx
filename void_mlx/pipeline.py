@@ -189,8 +189,39 @@ class VOIDPipeline:
         10 GB of load work inside the final decode memory window."""
         if self._loaded_checkpoint == checkpoint_path:
             return
-        load_void_weights(self.transformer, checkpoint_path)
+        if self.transformer is None:
+            # Released before a decode window (low-ram) — rebuild from
+            # scratch; the architecture itself is cheap, only the weight
+            # load costs anything.
+            self.transformer = _create_and_load_void_transformer(
+                self.base_model_path, checkpoint_path,
+            )
+        else:
+            load_void_weights(self.transformer, checkpoint_path)
         self._loaded_checkpoint = checkpoint_path
+
+    def _release_transformer(self) -> None:
+        """Drop the transformer (~10 GB bf16) ahead of a VAE decode window;
+        the next _ensure_checkpoint rebuilds it lazily. low-ram only —
+        default mode keeps reference-style residency."""
+        self.transformer = None
+        self._loaded_checkpoint = None
+        gc.collect()
+        mx.clear_cache()
+
+    def _decode_latents(self, current: mx.array) -> mx.array:
+        """Decode latents to pixels; in low-ram mode the transformer is
+        released first (it is dead weight during decode: pass1's weights
+        are about to be replaced by pass2's, and pass2's decode is the
+        last GPU work of the run — the transition window measured 115 %
+        of the working-set budget with it resident)."""
+        if self.low_ram:
+            self._release_transformer()
+        decoded = current.transpose(0, 1, 3, 4, 2) / self.vae.scaling_factor
+        output = self.vae.decode(decoded)
+        output = mx.clip(output / 2 + 0.5, 0, 1)
+        mx.eval(output)
+        return output
 
     def _encode_prompt(self, pipe, prompt: str) -> mx.array:
         """Encode once per prompt, then free T5.
@@ -318,6 +349,9 @@ class VOIDPipeline:
         """
         pipe = self._make_pipeline()
         self._ensure_checkpoint(self.pass1_checkpoint)
+        # pipe may have been built while the transformer was released
+        # (low-ram decode of a previous run) — rebind the fresh instance.
+        pipe.transformer = self.transformer
 
         if seed is not None:
             mx.random.seed(seed)
@@ -427,11 +461,8 @@ class VOIDPipeline:
                 if (i + 1) % 10 == 0 or i == 0:
                     print(f"    Step {i+1}/{num_inference_steps}")
 
-        # Decode
-        decoded = current.transpose(0, 1, 3, 4, 2) / self.vae.scaling_factor
-        output = self.vae.decode(decoded)
-        output = mx.clip(output / 2 + 0.5, 0, 1)
-        mx.eval(output)
+        # Decode (releases the transformer first in low-ram mode)
+        output = self._decode_latents(current)
 
         elapsed = time.monotonic() - t0
         print(f"  Pass 1: {elapsed:.1f}s ({elapsed/num_inference_steps:.1f}s/step)")
@@ -484,9 +515,14 @@ class VOIDPipeline:
         # (F_lat, H_lat, W_lat, C_lat) -> (1, F_lat, C_lat, H_lat, W_lat)
         warped_cf = mx.array(warped[None]).transpose(0, 1, 4, 2, 3).astype(WEIGHT_DTYPE)
 
-        # Load pass 2 weights (lazy/deduplicated)
+        # Load pass 2 weights (lazy/deduplicated). Deliberately AFTER the
+        # VAE re-encode + warped-noise generation so those windows run
+        # without the 10 GB transformer in low-ram mode.
         print("  Loading VOID pass2 weights...")
         self._ensure_checkpoint(self.pass2_checkpoint)
+        # pipe was built while the transformer was released (low-ram decode
+        # of pass 1) — rebind the fresh instance for _prepare_rotary_embeddings.
+        pipe.transformer = self.transformer
 
         # Prompt
         # Mirror reference prepare (pipeline...py:380): prompt embeds cast
@@ -509,11 +545,8 @@ class VOIDPipeline:
             pipe.scheduler, pipe.scheduler.timesteps,
         )
 
-        # Decode
-        decoded = current.transpose(0, 1, 3, 4, 2) / self.vae.scaling_factor
-        output = self.vae.decode(decoded)
-        output = mx.clip(output / 2 + 0.5, 0, 1)
-        mx.eval(output)
+        # Decode (releases the transformer first in low-ram mode)
+        output = self._decode_latents(current)
 
         elapsed = time.monotonic() - t0
         print(f"  Pass 2: {elapsed:.1f}s ({elapsed/num_inference_steps:.1f}s/step)")
