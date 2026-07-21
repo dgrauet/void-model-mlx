@@ -88,15 +88,25 @@ python -m void_mlx.infer \
 
 Drop `--pass2` to run a single pass (faster, still good quality for short clips).
 
+Add `--low-ram` on memory-constrained Macs: it frees the T5 text encoder
+(~9.5 GB) after prompt encoding, releases the transformer (~10 GB bf16)
+across VAE decode windows, and caps the MLX buffer cache so freed memory
+returns to the OS. Same output bit-for-bit, no measurable wall-time cost
+on single runs; without the flag everything stays resident (faster for
+batch use with enough RAM).
+
 ### 3. Memory Requirements
 
 | Setup | RAM Needed |
 |-------|-----------|
 | q4 VOID + q8 base, 13 frames at 352x624 | ~32 GB |
+| bf16 VOID + q8 base, `--low-ram`, 13 frames at 352x624 | ~32 GB (brief ~31 GB peaks at the two VAE decodes) |
 | q8 VOID + q8 base, 13 frames at 352x624 | ~48 GB |
 | bf16 VOID + q8 base | 64+ GB |
 
-A 32 GB MacBook Pro or Mac Mini can run the q4 configuration. Reduce `--max-frames`, `--height`, or `--width` if you hit memory limits.
+A 32 GB MacBook Pro or Mac Mini can run the q4 configuration — or full
+bf16 with `--low-ram`. Reduce `--max-frames`, `--height`, or `--width` if
+you hit memory limits.
 
 ---
 
